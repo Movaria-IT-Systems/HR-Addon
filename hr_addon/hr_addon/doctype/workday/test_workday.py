@@ -757,6 +757,36 @@ class TestDateIsInHolidayList(FrappeTestCase):
 		self.assertTrue(date_is_in_holiday_list("HR-EMP-00001", "2026-06-02"))
 
 
+def _bare_workday(**fields):
+	wd = Workday.__new__(Workday)
+	wd.employee_checkins = []
+	for name, value in fields.items():
+		setattr(wd, name, value)
+	return wd
+
+
+class TestLeaveKeepsWorkedHours(FrappeTestCase):
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.db.get_value", return_value=(0, None))
+	@patch.object(Workday, "_get_submitted_leave_application_name", return_value="HR-LAP-1")
+	def test_full_day_leave_keeps_punches_as_hours_above_zero(self, _leave, _values):
+		wd = _bare_workday(
+			target_hours=8, actual_working_hours=8, hours_worked=8, expected_break_hours=0.5
+		)
+		wd.employee_checkins = [frappe._dict(employee_checkin="CHK-1")]
+		wd.set_status_for_leave_application()
+		self.assertEqual(wd.status, "On Leave")
+		self.assertEqual(wd.target_hours, 0)
+		self.assertEqual(wd.actual_working_hours, 8)
+		self.assertEqual(wd.hours_worked, 8)
+
+	@patch("hr_addon.hr_addon.doctype.workday.workday.frappe.db.get_value", return_value=(0, None))
+	@patch.object(Workday, "_get_submitted_leave_application_name", return_value="HR-LAP-1")
+	def test_full_day_leave_without_punches_has_no_hours(self, _leave, _values):
+		wd = _bare_workday(target_hours=8, actual_working_hours=0, hours_worked=0)
+		wd.set_status_for_leave_application()
+		self.assertEqual((wd.status, wd.target_hours, wd.actual_working_hours), ("On Leave", 0, 0))
+
+
 class TestWorkdayHolidayLeaveOverride(FrappeTestCase):
 	@patch.object(Workday, "_cancel_leave_attendance_on_non_working_day")
 	@patch.object(Workday, "_apply_holiday_not_workday_fields")

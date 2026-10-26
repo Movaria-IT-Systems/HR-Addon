@@ -10,7 +10,7 @@ approved the usual way. Only drafts can be changed or withdrawn here.
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, getdate
+from frappe.utils import cint, date_diff, flt, getdate
 
 from hr_addon.api.employee_app import _current_employee, _looks_like_illness
 
@@ -63,6 +63,87 @@ def request_payload(doc):
 	else:
 		payload.update({"status": "Approved" if doc.docstatus == 1 else "Open", "note": doc.explanation or ""})
 	return payload
+
+
+@frappe.whitelist()
+def get_my_requests():
+	"""Every vacation, sick and home office request of the logged-in employee."""
+	from hr_addon.hr_addon.leave_days import charged_leave_days
+
+	employee = _current_employee()
+	leaves = frappe.get_all(
+		"Leave Application",
+		filters={"employee": employee},
+		fields=[
+			"name",
+			"leave_type",
+			"from_date",
+			"to_date",
+			"half_day",
+			"half_day_date",
+			"description",
+			"status",
+			"docstatus",
+		],
+		order_by="from_date desc",
+		limit=80,
+	)
+	homes = frappe.get_all(
+		"Attendance Request",
+		filters={"employee": employee, "reason": "Work From Home"},
+		fields=["name", "from_date", "to_date", "half_day", "explanation", "docstatus"],
+		order_by="from_date desc",
+		limit=80,
+	)
+	rows = []
+	for row in leaves:
+		illness = _looks_like_illness(row.leave_type)
+		rows.append(
+			{
+				"kind": "sick" if illness else "leave",
+				"request_kind": "leave",
+				"name": row.name,
+				"from_date": str(row.from_date),
+				"to_date": str(row.to_date),
+				"leave_type": row.leave_type,
+				"days": flt(
+					charged_leave_days(
+						employee,
+						row.leave_type,
+						row.from_date,
+						row.to_date,
+						row.half_day,
+						row.half_day_date,
+					)
+				),
+				"calendar_days": date_diff(row.to_date, row.from_date) + 1,
+				"half_day": bool(row.half_day),
+				"note": row.description or "",
+				"status": row.status,
+				"docstatus": row.docstatus,
+				"editable": row.docstatus == 0 and row.status == "Open",
+			}
+		)
+	for row in homes:
+		rows.append(
+			{
+				"kind": "home",
+				"request_kind": "home_office",
+				"name": row.name,
+				"from_date": str(row.from_date),
+				"to_date": str(row.to_date),
+				"leave_type": None,
+				"days": date_diff(row.to_date, row.from_date) + 1,
+				"calendar_days": date_diff(row.to_date, row.from_date) + 1,
+				"half_day": bool(row.half_day),
+				"note": row.explanation or "",
+				"status": "Approved" if row.docstatus == 1 else "Open",
+				"docstatus": row.docstatus,
+				"editable": row.docstatus == 0,
+			}
+		)
+	rows.sort(key=lambda row: (row["from_date"], row["name"]), reverse=True)
+	return rows
 
 
 @frappe.whitelist()

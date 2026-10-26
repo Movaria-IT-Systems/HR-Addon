@@ -1,8 +1,9 @@
 import frappe
 from erpnext.buying.doctype.supplier_scorecard.supplier_scorecard import daterange
 from frappe import _
-from frappe.utils import cint, flt, getdate
+from frappe.utils import cint, flt, formatdate, get_link_to_form, getdate
 from hrms.hr.doctype.leave_application.leave_application import (
+	AttendanceAlreadyMarkedError,
 	LeaveApplication,
 	get_leave_balance_on,
 	is_lwp,
@@ -95,6 +96,53 @@ class HrAddonLeaveApplication(LeaveApplication):
 			return self.get_total_leaves_on_half_day() >= 1
 		return True
 
+	def validate_attendance(self):
+		"""Attendance from working a free day is overtime, so it does not block leave.
+
+		A check-in also submits Present attendance on a normal working day. The
+		employee can still request leave for that past day; approval rewrites it
+		to On Leave. Work From Home on a day that deducts leave stays a conflict.
+		"""
+		rows = frappe.get_all(
+			"Attendance",
+			filters={
+				"employee": self.employee,
+				"attendance_date": ("between", [self.from_date, self.to_date]),
+				"status": ("in", ["Present", "Work From Home"]),
+				"docstatus": 1,
+				"half_day_status": ("!=", "Absent"),
+			},
+			fields=["name", "attendance_date", "status"],
+			order_by="attendance_date",
+		)
+		blocking = [
+			row
+			for row in rows
+			if row.status == "Work From Home" and self._date_charges_leave(row.attendance_date)
+		]
+		if not blocking:
+			return
+
+		frappe.throw(
+			_("Attendance for employee {0} is already marked for the following dates: {1}").format(
+				self.employee,
+				(
+					"<br><ul><li>"
+					+ "</li><li>".join(
+						get_link_to_form("Attendance", row.name, label=formatdate(row.attendance_date))
+						for row in blocking
+					)
+					+ "</li></ul>"
+				),
+			),
+			AttendanceAlreadyMarkedError,
+		)
+
+	def _date_charges_leave(self, day):
+		return (
+			charged_leave_days(self.employee, self.leave_type, day, day, 0, None) > 0
+		)
+
 	def _leave_type_deducts_from_ot_ledger(self):
 		lt = getattr(self, "leave_type", None)
 		if not lt:
@@ -157,6 +205,30 @@ class HrAddonLeaveApplication(LeaveApplication):
 
 		return attendance_name
 
+	def on_submit(self):
+		super().on_submit()
+		if self.status == "Approved":
+			self._refresh_covered_workdays()
+
+	def on_cancel(self):
+		super().on_cancel()
+		self._refresh_covered_workdays()
+
+	def _refresh_covered_workdays(self):
+		"""Recompute each Workday in the leave range so punches and leave agree.
+
+		Approving leave does not otherwise rebuild a Workday that already exists,
+		so a day with check-ins would stay Present and hide the leave.
+		"""
+		for dt in daterange(getdate(self.from_date), getdate(self.to_date)):
+			name = frappe.db.get_value(
+				"Workday", {"employee": self.employee, "log_date": dt}, "name"
+			)
+			if name:
+				workday = frappe.get_doc("Workday", name)
+				workday.flags.ignore_permissions = True
+				workday.save()
+
 	def update_attendance(self):
 		if self.status != "Approved":
 			return
@@ -179,12 +251,15 @@ class HrAddonLeaveApplication(LeaveApplication):
 				attendance_name = self._reconcile_ot_leave_attendance_name(date, attendance_name)
 
 			if date in holiday_dates or is_zero_hour_day(self.employee, date):
+				# Present / Work From Home here is the employee working a free day.
+				# Cancelling it would reverse the overtime. Leave attendance does not belong.
 				if attendance_name:
 					attendance = frappe.get_doc("Attendance", attendance_name)
-					attendance.flags.ignore_permissions = True
-					if attendance.docstatus == 1:
-						attendance.cancel()
-					frappe.delete_doc("Attendance", attendance_name, force=1)
+					if attendance.status not in ("Present", "Work From Home"):
+						attendance.flags.ignore_permissions = True
+						if attendance.docstatus == 1:
+							attendance.cancel()
+						frappe.delete_doc("Attendance", attendance_name, force=1)
 				continue
 
 			self.create_or_update_attendance(attendance_name, date)

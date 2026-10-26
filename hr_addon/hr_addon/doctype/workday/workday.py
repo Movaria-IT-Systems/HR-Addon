@@ -123,9 +123,13 @@ class Workday(Document):
 					self.actual_working_hours = -self.target_hours
 				self.status = "Half Day"
 			else:
+				# A full leave day has no target. Punches on that day are kept,
+				# so the hours count above zero (overtime) and the day stays On Leave.
 				self.target_hours = 0
 				self.expected_break_hours = 0
-				self.actual_working_hours = 0
+				if not self.employee_checkins:
+					self.actual_working_hours = 0
+					self.hours_worked = 0
 				self.status = "On Leave"
 
 	def update_status(self):
