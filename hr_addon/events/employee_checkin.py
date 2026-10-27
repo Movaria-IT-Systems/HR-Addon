@@ -1,7 +1,12 @@
 import frappe
+from functools import partial
+
 from frappe.utils import getdate
 
 SYNC_FLAG = "in_workday_checkin_sync"
+# A workday rebuild writes attendance and the overtime ledger, so it stays
+# running for a while. A second punch in that window must not be discarded.
+_SYNC_ATTEMPTS = 5
 
 
 def is_checkin_sync_enabled():
@@ -33,19 +38,69 @@ def enqueue_workday_sync(doc, method=None):
 		dates.add(getdate(previous.time))
 
 	for log_date in dates:
-		frappe.enqueue(
-			"hr_addon.events.employee_checkin.sync_workday",
-			queue="short",
-			enqueue_after_commit=True,
-			job_id=f"workday-checkin-sync::{doc.employee}::{log_date}",
-			deduplicate=True,
-			employee=doc.employee,
-			log_date=str(log_date),
+		# Queue only after this punch is committed, and record that a newer
+		# punch exists so a rebuild that is already running does one more pass.
+		frappe.db.after_commit.add(
+			partial(_queue_workday_sync, doc.employee, str(log_date))
 		)
 
 
+def _queue_workday_sync(employee, log_date):
+	log_date = str(getdate(log_date))
+	_bump_sync_generation(employee, log_date)
+	frappe.enqueue(
+		"hr_addon.events.employee_checkin.sync_workday",
+		queue="short",
+		enqueue_after_commit=False,
+		job_id=f"workday-checkin-sync::{employee}::{log_date}",
+		deduplicate=True,
+		employee=employee,
+		log_date=log_date,
+	)
+
+
+def _enqueue_sync_followup(employee, log_date):
+	"""One more rebuild once the worker that holds this day is finished.
+
+	Deduped on its own id, so a running rebuild does not swallow it.
+	"""
+	log_date = str(getdate(log_date))
+	frappe.enqueue(
+		"hr_addon.events.employee_checkin.sync_workday",
+		queue="short",
+		enqueue_after_commit=False,
+		job_id=f"workday-checkin-sync::{employee}::{log_date}::followup",
+		deduplicate=True,
+		employee=employee,
+		log_date=log_date,
+	)
+
+
 def sync_workday(employee, log_date):
-	"""Recalculate one Workday from its Employee Checkins, creating it when missing."""
+	"""Recalculate one Workday from its Employee Checkins, creating it when missing.
+
+	Punches that land while a rebuild is in progress bump a counter. This runs
+	again until that counter stays still, so the saved day matches the punches.
+	"""
+	log_date = getdate(log_date)
+	locked = _acquire_sync_lock(employee, log_date)
+	if locked is False:
+		_enqueue_sync_followup(employee, log_date)
+		return
+
+	try:
+		for _attempt in range(_SYNC_ATTEMPTS):
+			seen = _sync_generation(employee, log_date)
+			_sync_workday_once(employee, log_date)
+			if _sync_generation(employee, log_date) == seen:
+				return
+		_enqueue_sync_followup(employee, log_date)
+	finally:
+		if locked:
+			_release_sync_lock(employee, log_date)
+
+
+def _sync_workday_once(employee, log_date):
 	from hr_addon.hr_addon.doctype.workday.workday import has_weekly_working_hours_for_date
 
 	log_date = getdate(log_date)
@@ -119,12 +174,49 @@ def _end_sync_savepoint(save_point, rollback):
 
 
 def has_checkins(employee, log_date):
-	return bool(
-		frappe.db.count(
-			"Employee Checkin",
-			{
-				"employee": employee,
-				"time": ["between", [f"{log_date} 00:00:00", f"{log_date} 23:59:59"]],
-			},
-		)
+	# Same date match the workday uses. A raw between-filter can miss a punch
+	# the calendar still lists, and the day is then left open.
+	from hr_addon.hr_addon.doctype.workday.workday import get_employee_checkin
+
+	return bool(get_employee_checkin(employee, log_date))
+
+
+def _sync_redis_key(employee, log_date, suffix):
+	return frappe.cache().make_key(
+		f"hr_addon:workday-sync:{suffix}:{employee}:{getdate(log_date)}"
 	)
+
+
+def _bump_sync_generation(employee, log_date):
+	try:
+		cache = frappe.cache()
+		key = _sync_redis_key(employee, log_date, "gen")
+		value = cache.incr(key)
+		cache.expire(key, 6 * 60 * 60)
+		return int(value)
+	except Exception:
+		return None
+
+
+def _sync_generation(employee, log_date):
+	try:
+		value = frappe.cache().get(_sync_redis_key(employee, log_date, "gen"))
+		return int(value) if value is not None else 0
+	except Exception:
+		return 0
+
+
+def _acquire_sync_lock(employee, log_date):
+	"""True when this worker owns the day. False when another rebuild does. None without Redis."""
+	try:
+		key = _sync_redis_key(employee, log_date, "lock")
+		return bool(frappe.cache().set(key, b"1", nx=True, ex=180))
+	except Exception:
+		return None
+
+
+def _release_sync_lock(employee, log_date):
+	try:
+		frappe.cache().delete(_sync_redis_key(employee, log_date, "lock"))
+	except Exception:
+		return

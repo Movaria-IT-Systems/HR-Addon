@@ -26,7 +26,11 @@ def _make_checkin(time="2026-07-25 09:00:00", employee="HR-EMP-00001", previous_
 
 class TestEnqueueWorkdaySync(FrappeTestCase):
 	def tearDown(self):
+		frappe.db.after_commit.reset()
 		setattr(frappe.flags, SYNC_FLAG, False)
+
+	def _flush_queue(self):
+		frappe.db.after_commit.run()
 
 	# enqueue_workday_sync: does nothing while the setting is off.
 	@patch("hr_addon.events.employee_checkin.frappe.enqueue")
@@ -36,6 +40,7 @@ class TestEnqueueWorkdaySync(FrappeTestCase):
 	)
 	def test_enqueue_skipped_when_disabled(self, _mock_setting, mock_enqueue):
 		enqueue_workday_sync(_make_checkin(), "on_update")
+		self._flush_queue()
 		mock_enqueue.assert_not_called()
 
 	# enqueue_workday_sync: does not re-enter while a sync is already running.
@@ -47,6 +52,7 @@ class TestEnqueueWorkdaySync(FrappeTestCase):
 	def test_enqueue_skipped_during_sync(self, _mock_setting, mock_enqueue):
 		setattr(frappe.flags, SYNC_FLAG, True)
 		enqueue_workday_sync(_make_checkin(), "on_update")
+		self._flush_queue()
 		mock_enqueue.assert_not_called()
 
 	# enqueue_workday_sync: queues one deduplicated job for the checkin date.
@@ -57,12 +63,14 @@ class TestEnqueueWorkdaySync(FrappeTestCase):
 	)
 	def test_enqueue_queues_job_for_checkin_date(self, _mock_setting, mock_enqueue):
 		enqueue_workday_sync(_make_checkin(), "on_update")
+		self.assertFalse(mock_enqueue.called)
+		self._flush_queue()
 		self.assertEqual(mock_enqueue.call_count, 1)
 		kwargs = mock_enqueue.call_args.kwargs
 		self.assertEqual(kwargs["log_date"], "2026-07-25")
 		self.assertEqual(kwargs["employee"], "HR-EMP-00001")
 		self.assertTrue(kwargs["deduplicate"])
-		self.assertTrue(kwargs["enqueue_after_commit"])
+		self.assertFalse(kwargs["enqueue_after_commit"])
 
 	# enqueue_workday_sync: a corrected timestamp refreshes the old date as well.
 	@patch("hr_addon.events.employee_checkin.frappe.enqueue")
@@ -74,6 +82,7 @@ class TestEnqueueWorkdaySync(FrappeTestCase):
 		enqueue_workday_sync(
 			_make_checkin(previous_time="2026-07-24 09:00:00"), "on_update"
 		)
+		self._flush_queue()
 		queued_dates = {call.kwargs["log_date"] for call in mock_enqueue.call_args_list}
 		self.assertEqual(queued_dates, {"2026-07-24", "2026-07-25"})
 
@@ -196,6 +205,48 @@ class TestSyncWorkday(FrappeTestCase):
 		mock_get_doc.return_value = workday
 		sync_workday("HR-EMP-00001", "2026-07-25")
 		self.assertEqual(frappe.get_message_log(), [])
+
+	# A punch that arrives while the rebuild is saving must be applied, not dropped.
+	@patch("hr_addon.events.employee_checkin._release_sync_lock")
+	@patch("hr_addon.events.employee_checkin._acquire_sync_lock", return_value=True)
+	@patch("hr_addon.events.employee_checkin._sync_generation", side_effect=[1, 2, 2, 2])
+	@patch("hr_addon.events.employee_checkin.frappe.db.commit")
+	@patch("hr_addon.events.employee_checkin.frappe.get_doc")
+	@patch(
+		"hr_addon.events.employee_checkin.frappe.db.get_value",
+		return_value="WD-2026-00001",
+	)
+	@patch(
+		"hr_addon.hr_addon.doctype.workday.workday.has_weekly_working_hours_for_date",
+		return_value=True,
+	)
+	@patch("hr_addon.events.employee_checkin.frappe.db.exists", return_value="HR-EMP-00001")
+	def test_sync_repeats_when_a_punch_lands_during_the_save(
+		self,
+		_mock_exists,
+		_mock_weekly,
+		_mock_get_value,
+		mock_get_doc,
+		_mock_commit,
+		_mock_generation,
+		_mock_lock,
+		_mock_release,
+	):
+		workday = MagicMock()
+		mock_get_doc.return_value = workday
+		sync_workday("HR-EMP-00001", "2026-07-25")
+		self.assertEqual(workday.save.call_count, 2)
+
+	# The worker that already holds the day keeps the new punch for a follow-up.
+	@patch("hr_addon.events.employee_checkin._enqueue_sync_followup")
+	@patch("hr_addon.events.employee_checkin._acquire_sync_lock", return_value=False)
+	@patch("hr_addon.events.employee_checkin.frappe.get_doc")
+	def test_sync_defers_when_another_rebuild_holds_the_day(
+		self, mock_get_doc, _mock_lock, mock_followup
+	):
+		sync_workday("HR-EMP-00001", "2026-07-25")
+		mock_get_doc.assert_not_called()
+		mock_followup.assert_called_once()
 
 
 class TestAttendanceIgnoresEmployeePermissions(FrappeTestCase):
