@@ -11,6 +11,7 @@ from hr_addon.api.insights import (
 	segments_for_day,
 	summarize_project_bookings,
 	span_bounds,
+	uses_daily_timeline,
 	_year_marks,
 )
 
@@ -27,6 +28,21 @@ class TestInsightSpan(FrappeTestCase):
 		self.assertEqual(span, "month")
 		self.assertEqual(str(start), "2026-11-01")
 		self.assertEqual(str(end), "2026-11-30")
+
+	def test_last_30_days_end_today(self):
+		span, start, end = span_bounds("days30", "2026-11-04")
+		self.assertEqual(span, "days30")
+		self.assertEqual(str(start), "2026-10-06")
+		self.assertEqual(str(end), "2026-11-04")
+		self.assertTrue(uses_daily_timeline(span, start, end))
+
+	def test_custom_range_swaps_and_caps_a_year(self):
+		span, start, end = span_bounds("custom", "2026-11-04", "2026-03-01", "2026-01-01")
+		self.assertEqual((span, str(start), str(end)), ("custom", "2026-01-01", "2026-03-01"))
+		span, start, end = span_bounds("custom", "2026-11-04", "2020-01-01", "2026-06-01")
+		self.assertEqual(str(start), "2020-01-01")
+		self.assertEqual(str(end), "2020-12-31")
+		self.assertFalse(uses_daily_timeline(span, start, end))
 
 
 class TestInsightHours(FrappeTestCase):

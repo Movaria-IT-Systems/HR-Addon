@@ -10,7 +10,7 @@ import calendar
 from datetime import datetime
 
 import frappe
-from frappe.utils import add_days, cint, flt, get_datetime, getdate
+from frappe.utils import add_days, cint, date_diff, flt, get_datetime, getdate
 
 from hr_addon.api.employee_app import (
 	_current_employee,
@@ -23,20 +23,53 @@ from hr_addon.api.employee_app import (
 )
 from hr_addon.hr_addon.leave_days import _dates, _holiday_dates, charged_leave_days, is_zero_hour_day
 
-SPANS = ("week", "month", "year")
+SPANS = ("week", "month", "year", "days30", "custom")
+# A custom range longer than this uses the year heatmap instead of one row per day.
+DAILY_LIMIT = 62
 
 
-def span_bounds(span, today):
-	"""Monday–Sunday, the calendar month, or the calendar year that contains `today`."""
+def span_bounds(span, today, from_date=None, to_date=None):
+	"""Monday–Sunday, the calendar month, the calendar year, the last 30 days, or a chosen range.
+
+	The last 30 days end today. A custom range is swapped if the end is before the start,
+	and cut to 366 days.
+	"""
 	today = getdate(today)
+	if span == "custom":
+		start, end = _custom_bounds(today, from_date, to_date)
+		return "custom", start, end
 	span = span if span in SPANS else "month"
 	if span == "week":
 		start = add_days(today, -today.weekday())
 		return span, start, add_days(start, 6)
 	if span == "year":
 		return span, getdate(f"{today.year}-01-01"), getdate(f"{today.year}-12-31")
+	if span == "days30":
+		return span, add_days(today, -29), today
 	last = calendar.monthrange(today.year, today.month)[1]
 	return span, getdate(f"{today.year}-{today.month:02d}-01"), getdate(f"{today.year}-{today.month:02d}-{last}")
+
+
+def uses_daily_timeline(span, start, end):
+	"""One check-in row per day. Longer ranges use the compact year marks."""
+	if span == "year":
+		return False
+	if span == "custom" and date_diff(end, start) + 1 > DAILY_LIMIT:
+		return False
+	return True
+
+
+def _custom_bounds(today, from_date, to_date):
+	try:
+		start = getdate(from_date) if from_date else add_days(today, -29)
+		end = getdate(to_date) if to_date else today
+	except Exception:
+		start, end = add_days(today, -29), today
+	if end < start:
+		start, end = end, start
+	if date_diff(end, start) > 365:
+		end = add_days(start, 365)
+	return start, end
 
 
 def segments_for_day(punches, now=None, is_today=False):
@@ -453,11 +486,11 @@ def _punches(employee, start, end):
 
 
 @frappe.whitelist()
-def get_my_insights(span="month"):
+def get_my_insights(span="month", from_date=None, to_date=None):
 	employee = _current_employee()
 	today = getdate()
 	now = datetime.now()
-	span, start, end = span_bounds(span, today)
+	span, start, end = span_bounds(span, today, from_date, to_date)
 	leaves = _leave_rows(employee, start, end)
 	homes = _home_office_rows(employee, start, end)
 	sick, sick_pending, vacation_taken, vacation_pending = _leave_totals(employee, leaves, start, end)
@@ -465,7 +498,8 @@ def get_my_insights(span="month"):
 	balances = _balances(employee, today)
 
 	punches = _punches(employee, start, end)
-	if span == "year":
+	dense = uses_daily_timeline(span, start, end)
+	if not dense:
 		rows = _workday_rows(employee, start, end)
 		chart_days = [
 			{
@@ -487,6 +521,7 @@ def get_my_insights(span="month"):
 	overtime_enabled = bool(cint(frappe.db.get_single_value("HR Addon Settings", "enable_overtime_ledger_feature")))
 	return {
 		"span": span,
+		"dense": dense,
 		"from_date": str(start),
 		"to_date": str(end),
 		"today": str(today),
